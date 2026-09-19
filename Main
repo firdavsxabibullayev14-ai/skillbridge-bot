@@ -1,0 +1,409 @@
+"""
+SkillBridge AI — Telegram Bot (MVP)
+Kutubxona: aiogram 3.x
+AI: OpenAI GPT-4o API
+
+Ishga tushirish:
+    python main.py
+
+Talab qilinadigan environment o'zgaruvchilari (.env faylida):
+    BOT_TOKEN=...........  (@BotFather dan olinadi)
+    OPENAI_API_KEY=......  (platform.openai.com dan olinadi)
+"""
+
+import asyncio
+import logging
+import os
+from dataclasses import dataclass, field
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+
+# --------------------------------------------------------------------------
+# SOZLAMALAR
+# --------------------------------------------------------------------------
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("skillbridge")
+
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+router = Router()
+
+# --------------------------------------------------------------------------
+# FSM HOLATLARI (User Flow bosqichlari)
+# --------------------------------------------------------------------------
+class Onboarding(StatesGroup):
+    waiting_name = State()
+    waiting_region = State()
+    waiting_level = State()
+
+
+class Diagnostics(StatesGroup):
+    question_index = State()
+    answers = State()
+
+
+class MentorChat(StatesGroup):
+    chatting = State()
+
+
+# --------------------------------------------------------------------------
+# "BAZA" — MVP uchun oddiy xotira (keyinchalik Airtable/Notion API bilan almashtiriladi)
+# --------------------------------------------------------------------------
+@dataclass
+class UserProfile:
+    name: str = ""
+    region: str = ""
+    level: str = ""
+    scores: dict = field(default_factory=lambda: {"logic": 0, "creative": 0, "communication": 0, "tech": 0})
+    result_track: str = ""
+
+
+USER_DB: dict[int, UserProfile] = {}
+
+
+def get_profile(user_id: int) -> UserProfile:
+    if user_id not in USER_DB:
+        USER_DB[user_id] = UserProfile()
+    return USER_DB[user_id]
+
+
+# --------------------------------------------------------------------------
+# DIAGNOSTIKA SAVOLLARI (5 ta, inline tugmalar orqali)
+# Har bir variant qaysi yo'nalishga ko'proq mos kelishini bildiradi
+# --------------------------------------------------------------------------
+DIAGNOSTIC_QUESTIONS = [
+    {
+        "text": "1-savol: Bo'sh vaqtingizda nima qilishni afzal ko'rasiz?",
+        "options": [
+            ("Rasm chizish yoki dizayn bilan shug'ullanish", "creative"),
+            ("Mantiqiy jumboqlar yoki dasturlash bilan shug'ullanish", "tech"),
+            ("Do'stlar bilan suhbatlashish, ijtimoiy tarmoqlarda vaqt o'tkazish", "communication"),
+        ],
+    },
+    {
+        "text": "2-savol: Guruh loyihasida sizga qaysi rol yoqadi?",
+        "options": [
+            ("G'oyalar va vizual taqdimot bilan shug'ullanish", "creative"),
+            ("Texnik qismni tuzish va tizimlashtirish", "tech"),
+            ("Jamoani boshqarish va mijozlar bilan muloqot qilish", "communication"),
+        ],
+    },
+    {
+        "text": "3-savol: Yangi dastur yoki ilovani ko'rganingizda birinchi nimaga e'tibor berasiz?",
+        "options": [
+            ("Uning rangi, shrifti va umumiy ko'rinishiga", "creative"),
+            ("Qanday ishlashi, algoritmiga", "tech"),
+            ("Foydalanuvchilar uni qanday qabul qilishiga", "communication"),
+        ],
+    },
+    {
+        "text": "4-savol: Sizga qaysi topshiriq qiziqroq?",
+        "options": [
+            ("Brend uchun logotip yoki banner yaratish", "creative"),
+            ("Veb-sayt yoki botni sozlash / xatoliklarni tuzatish", "tech"),
+            ("Mijozga xat yozish yoki taklif tayyorlash", "communication"),
+        ],
+    },
+    {
+        "text": "5-savol: Kelajakda qaysi ko'nikmani chuqurroq rivojlantirmoqchisiz?",
+        "options": [
+            ("AI-Art / Grafik dizayn", "creative"),
+            ("No-Code / AI avtomatlashtirish", "tech"),
+            ("SMM / Copywriting / Muzokara", "communication"),
+        ],
+    },
+]
+
+# Diagnostika natijasiga qarab tavsiya etiladigan kasb "pasporti"
+CAREER_RESULTS = {
+    "creative": {
+        "title": "Grafik Dizayn va AI-Art",
+        "match": "85%",
+        "income": "$300–$800/oy",
+    },
+    "tech": {
+        "title": "AI & No-Code (Sayt / Bot yaratish)",
+        "match": "88%",
+        "income": "$400–$1000/oy",
+    },
+    "communication": {
+        "title": "SMM & Copywriting (AI yordamida)",
+        "match": "82%",
+        "income": "$250–$700/oy",
+    },
+}
+
+
+# --------------------------------------------------------------------------
+# KLAVIATURALAR
+# --------------------------------------------------------------------------
+def build_question_keyboard(question_idx: int) -> InlineKeyboardMarkup:
+    options = DIAGNOSTIC_QUESTIONS[question_idx]["options"]
+    buttons = [
+        [InlineKeyboardButton(text=label, callback_data=f"diag:{question_idx}:{tag}")]
+        for label, tag in options
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def build_result_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎬 Bepul 1-darsni ko'rish", callback_data="lesson:demo")],
+            [InlineKeyboardButton(text="🤖 AI-Mentor bilan gaplashish", callback_data="mentor:start")],
+        ]
+    )
+
+
+def build_cabinet_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📚 Mening Darslarim", callback_data="cabinet:lessons")],
+            [InlineKeyboardButton(text="🤖 AI Mentor", callback_data="mentor:start")],
+            [InlineKeyboardButton(text="💼 Frilans Baza", callback_data="cabinet:freelance")],
+            [InlineKeyboardButton(text="🚀 Premium / Kurslar", callback_data="cabinet:premium")],
+        ]
+    )
+
+
+def build_level_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="O'quvchi", callback_data="level:o'quvchi")],
+            [InlineKeyboardButton(text="Talaba", callback_data="level:talaba")],
+            [InlineKeyboardButton(text="Ishsiz / ish qidiryapman", callback_data="level:ishsiz")],
+            [InlineKeyboardButton(text="Ishlayapman, kasb almashtirmoqchiman", callback_data="level:band")],
+        ]
+    )
+
+
+# --------------------------------------------------------------------------
+# /start VA ONBOARDING
+# --------------------------------------------------------------------------
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    profile = get_profile(message.from_user.id)
+    profile.scores = {"logic": 0, "creative": 0, "communication": 0, "tech": 0}
+
+    await message.answer(
+        "👋 Salom! Men <b>SkillBridge AI</b> — sening shaxsiy sun'iy intellekt mentoringman.\n\n"
+        "Qaysi kasbda yuqori daromad topishing mumkinligini 2 daqiqada aniqlab beraman.\n\n"
+        "Avvalo, ismingizni yozing:",
+        parse_mode="HTML",
+    )
+    await state.set_state(Onboarding.waiting_name)
+
+
+@router.message(Onboarding.waiting_name)
+async def process_name(message: Message, state: FSMContext):
+    profile = get_profile(message.from_user.id)
+    profile.name = message.text.strip()
+
+    await message.answer(f"Rahmat, {profile.name}! Endi qaysi hududdan ekanligingizni yozing (masalan: Buxoro, G'ijduvon):")
+    await state.set_state(Onboarding.waiting_region)
+
+
+@router.message(Onboarding.waiting_region)
+async def process_region(message: Message, state: FSMContext):
+    profile = get_profile(message.from_user.id)
+    profile.region = message.text.strip()
+
+    await message.answer(
+        "Hozirgi darajangizni tanlang:",
+        reply_markup=build_level_keyboard(),
+    )
+    await state.set_state(Onboarding.waiting_level)
+
+
+@router.callback_query(Onboarding.waiting_level, F.data.startswith("level:"))
+async def process_level(callback: CallbackQuery, state: FSMContext):
+    level = callback.data.split(":", 1)[1]
+    profile = get_profile(callback.from_user.id)
+    profile.level = level
+
+    await callback.message.edit_text(f"Daraja tanlandi: <b>{level}</b>", parse_mode="HTML")
+    await callback.answer()
+
+    # Diagnostikani boshlash
+    await state.update_data(question_index=0)
+    await ask_next_question(callback.message, state)
+
+
+# --------------------------------------------------------------------------
+# AI-DIAGNOSTIKA (5 ta savol)
+# --------------------------------------------------------------------------
+async def ask_next_question(message: Message, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get("question_index", 0)
+
+    if idx >= len(DIAGNOSTIC_QUESTIONS):
+        await show_result(message, state)
+        return
+
+    question = DIAGNOSTIC_QUESTIONS[idx]
+    await message.answer(question["text"], reply_markup=build_question_keyboard(idx))
+    await state.set_state(Diagnostics.question_index)
+
+
+@router.callback_query(F.data.startswith("diag:"))
+async def process_diagnostic_answer(callback: CallbackQuery, state: FSMContext):
+    _, idx_str, tag = callback.data.split(":")
+    idx = int(idx_str)
+
+    profile = get_profile(callback.from_user.id)
+    profile.scores[tag] = profile.scores.get(tag, 0) + 1
+
+    await callback.message.edit_text(f"✅ Javob qabul qilindi ({idx + 1}/{len(DIAGNOSTIC_QUESTIONS)})")
+    await callback.answer()
+
+    await state.update_data(question_index=idx + 1)
+    await ask_next_question(callback.message, state)
+
+
+async def show_result(message: Message, state: FSMContext):
+    profile = get_profile(message.chat.id if message.chat else message.from_user.id)
+    # Eng ko'p ball to'plagan yo'nalishni aniqlash
+    best_track = max(profile.scores, key=lambda k: profile.scores.get(k, 0))
+    # "logic" alohida track emas, tech ga qo'shiladi
+    if best_track == "logic":
+        best_track = "tech"
+
+    result = CAREER_RESULTS.get(best_track, CAREER_RESULTS["tech"])
+    profile.result_track = result["title"]
+
+    await message.answer(
+        f"🎯 <b>Sening natijang:</b> {result['match']} — <b>{result['title']}</b> sohasiga mos keladi!\n\n"
+        f"💰 O'rtacha frilans daromadi: <b>{result['income']}</b>\n\n"
+        "Endi birinchi bepul darsni ko'rishni yoki AI-Mentor bilan gaplashishni xohlaysizmi?",
+        parse_mode="HTML",
+        reply_markup=build_result_keyboard(),
+    )
+
+
+# --------------------------------------------------------------------------
+# NATIJADAN KEYINGI TUGMALAR: bepul dars, shaxsiy kabinet
+# --------------------------------------------------------------------------
+@router.callback_query(F.data == "lesson:demo")
+async def send_demo_lesson(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer(
+        "🎬 <b>1-Mikro-dars (Demo):</b>\n\n"
+        "Bugungi mavzu: 'AI-Prompting asoslari' — sun'iy intellektga to'g'ri buyruq (prompt) berishni o'rganamiz.\n\n"
+        "Darsni tugatgach, shaxsiy kabinetingizga o'ting 👇",
+        parse_mode="HTML",
+    )
+    await show_cabinet(callback.message)
+
+
+@router.callback_query(F.data.startswith("cabinet:"))
+async def cabinet_sections(callback: CallbackQuery):
+    section = callback.data.split(":", 1)[1]
+    await callback.answer()
+
+    texts = {
+        "lessons": "📚 <b>Mening Darslarim</b>\n\nHozircha boshlangan kurslaringiz yo'q. Demo darsdan boshlang!",
+        "freelance": "💼 <b>Frilans Baza</b>\n\nBu yerda AI yordamida rezume, portfolio va Upwork uchun Cover Letter yaratishingiz mumkin. Buni ishlab chiqish uchun AI-Mentor bilan gaplashing.",
+        "premium": "🚀 <b>Premium / Kurslar</b>\n\nTo'liq kurslar va oylik obuna (Payme/Click) tez orada ulanadi.",
+    }
+    await callback.message.answer(texts.get(section, "Bo'lim topilmadi."), parse_mode="HTML")
+
+
+async def show_cabinet(message: Message):
+    await message.answer("📋 <b>Shaxsiy Kabinet</b>\n\nQuyidagilardan birini tanlang:", parse_mode="HTML", reply_markup=build_cabinet_keyboard())
+
+
+@router.message(F.text == "/cabinet")
+async def cmd_cabinet(message: Message):
+    await show_cabinet(message)
+
+
+# --------------------------------------------------------------------------
+# AI-MENTOR (OpenAI GPT-4o bilan chat)
+# --------------------------------------------------------------------------
+MENTOR_SYSTEM_PROMPT = (
+    "Siz SkillBridge AI platformasining do'stona va rag'batlantiruvchi AI-mentorisiz. "
+    "Siz O'zbekistondagi qishloq va shahar chetidagi yoshlarga zamonaviy kasblar "
+    "(grafik dizayn, no-code, SMM, copywriting, AI-prompting) bo'yicha amaliy maslahat berasiz. "
+    "Javoblaringiz qisqa, aniq va amaliy bo'lsin. O'zbek tilida javob bering."
+)
+
+
+@router.callback_query(F.data == "mentor:start")
+async def start_mentor_chat(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(MentorChat.chatting)
+    await callback.message.answer(
+        "🤖 <b>AI-Mentor</b> bilan bog'landingiz. Menga savolingizni yozing "
+        "(masalan: 'Portfolio qanday tuzaman?' yoki 'Midjourney qanday ishlaydi?').\n\n"
+        "Chatdan chiqish uchun /cabinet buyrug'ini yuboring.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(MentorChat.chatting)
+async def mentor_chat_handler(message: Message, state: FSMContext):
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await show_cabinet(message)
+        return
+
+    if openai_client is None:
+        await message.answer(
+            "⚠️ AI-Mentor hozircha ulanmagan (OPENAI_API_KEY o'rnatilmagan). "
+            "Iltimos, .env faylida OPENAI_API_KEY ni to'ldiring."
+        )
+        return
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": MENTOR_SYSTEM_PROMPT},
+                {"role": "user", "content": message.text},
+            ],
+            max_tokens=500,
+        )
+        answer_text = response.choices[0].message.content
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("OpenAI so'roviga xatolik")
+        answer_text = "Kechirasiz, hozir javob bera olmadim. Birozdan so'ng qayta urinib ko'ring."
+
+    await message.answer(answer_text)
+
+
+# --------------------------------------------------------------------------
+# ISHGA TUSHIRISH
+# --------------------------------------------------------------------------
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN topilmadi. .env fayliga BOT_TOKEN=... qo'shing.")
+
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    logger.info("SkillBridge AI bot ishga tushdi...")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
